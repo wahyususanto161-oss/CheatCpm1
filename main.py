@@ -406,31 +406,22 @@ class Reader:
         return d
 
     def read_equipment(self):
-        if self.pos + 4 > len(self.buf):
-            return []
-        count = self.read_int()
-        if count < 0 or count > 100000:
-            return []
-        out = []
-        for _ in range(count):
-            if self.pos >= len(self.buf):
-                break
-            typ = self.read_byte()
-            if typ == 0:
-                out.append({"type": 0, "id": self.read_int(), "color": self.read_int()})
-            elif typ == 1:
-                out.append({"type": 1, "id": self.read_int()})
-            elif typ == 2:
-                out.append({
-                    "type": 2,
-                    "id": self.read_int(),
-                    "color": self.read_int(),
-                    "float": self.read_float(),
-                })
-            else:
-                out.append({"type": typ, "id": self.read_int()})
-        return out
-
+        if self.read_byte() == 0: return None
+        return {
+            "hair": self.read_list(self.read_int),
+            "face": self.read_list(self.read_int),
+            "beard": self.read_list(self.read_int),
+            "cap": self.read_list(self.read_int),
+            "mask": self.read_list(self.read_int),
+            "top": self.read_list(self.read_int),
+            "gloves": self.read_list(self.read_int),
+            "bag": self.read_list(self.read_int),
+            "pants": self.read_list(self.read_int),
+            "shoes": self.read_list(self.read_int),
+            "glasses": self.read_list(self.read_int),
+            "SelectedEquipments": self.read_list(self.read_int),
+            "Gender": self.read_int(),
+        }
 
 
 def parse_player(buf):
@@ -556,24 +547,11 @@ class Writer:
         for item in lst: fn(item)
 
     def write_equipment(self, data):
-        data = data or []
-        self.write_int(len(data))
-        for item in data:
-            item = item or {}
-            typ = int(item.get("type", 0))
-            self.write_byte(typ)
-            if typ == 0:
-                self.write_int(item.get("id", 0))
-                self.write_int(item.get("color", 0))
-            elif typ == 1:
-                self.write_int(item.get("id", 0))
-            elif typ == 2:
-                self.write_int(item.get("id", 0))
-                self.write_int(item.get("color", 0))
-                self.write_float(item.get("float", 0.0))
-            else:
-                self.write_int(item.get("id", 0))
-
+        if not data: self.write_byte(0); return
+        self.write_byte(13)
+        for k in ["hair","face","beard","cap","mask","top","gloves","bag","pants","shoes","glasses","SelectedEquipments"]:
+            self.write_list(data.get(k, []), self.write_int)
+        self.write_int(data.get("Gender", 0))
 
     def write_plates(self, data):
         if not data: self.write_byte(0); return
@@ -657,6 +635,54 @@ def serialize_field(fid, value):
         return w.to_bytes()
     return None
 
+
+
+def serialize_full_record(record):
+    """Serialize the complete CPM player record using the same record layout
+    understood by this file's Reader/Writer. Used as a fallback for fields
+    that the partial-save endpoint rejects.
+    """
+    w = Writer()
+    w.write_byte(1)
+    w.write_string(record.get("Name", ""))
+    w.write_int(record.get("money", 0))
+    w.write_int(record.get("coin", 0))
+    w.write_string(record.get("localID", ""))
+    w.write_list(record.get("boughtFsos", []), w.write_int)
+
+    def wf(friend):
+        friend = friend or {}
+        w.write_byte(3)
+        w.write_string(friend.get("id", ""))
+        w.write_string(friend.get("Name", ""))
+        w.write_string(friend.get("accountID", ""))
+
+    w.write_list(record.get("FriendsID", []), wf)
+    w.write_list(record.get("LevelsDoneTime", []), w.write_float)
+    w.write_list(record.get("floats", []), w.write_float)
+    w.write_list(record.get("integers", []), w.write_int)
+    w.write_list(record.get("fcar", []), w.write_int)
+    w.write_list(record.get("favouriteWheels", []), w.write_int)
+    w.write_list(record.get("favouriteVinyls", []), w.write_int)
+    w.write_list(record.get("favouriteEmojis", []), w.write_int)
+    w.write_equipment(record.get("personEquipmentsMale"))
+    w.write_equipment(record.get("personEquipmentsFemale"))
+    w.write_plates(record.get("platesData"))
+    w.write_car_id_status(record.get("carIDnStatus"))
+    w.write_string(record.get("allData", ""))
+
+    flags = record.get("flags") or {}
+    w._p.append(struct.pack("<i", len(flags)))
+    for k, v in flags.items():
+        w.write_int(int(k))
+        w.write_int(int(v))
+
+    w.write_list(record.get("animations", []), w.write_int)
+    w.write_list(record.get("emojiPacks", []), w.write_int)
+    w.write_list(record.get("wheels", []), w.write_int)
+    w.write_list(record.get("boughtPoliceLights", []), w.write_int)
+    w.write_list(record.get("boughtPoliceSirens", []), w.write_int)
+    return w.to_bytes()
 
 def build_payload(record, uid, original=None):
     fields = []
@@ -885,6 +911,64 @@ class CPMNuker:
             return False,f"SAVE_FAILED: {str(r)[:100]}"
         except Exception as e: return False,str(e)
 
+
+    async def _full_save_record(self, uid, data):
+        """Fallback to the full-record SavePlayerRecordsPartially8 format.
+        The same endpoint is used, but this sends the complete compressed
+        player record rather than a partial field packet.
+        """
+        td = self.get_token_data(uid) or {}
+        fuid = td.get("firebase_uid", "")
+        email = td.get("email", "")
+        password = td.get("password", "")
+        if not fuid:
+            return {"ok": False, "message": "NO_UID"}
+
+        try:
+            raw = serialize_full_record(data)
+            if not raw:
+                return {"ok": False, "message": "FULL_SERIALIZE_FAILED"}
+            packed = zlib.compress(raw)
+            b64 = base64.b64encode(packed).decode("ascii")
+            payload = {
+                "uid": fuid,
+                "password": password,
+                "email": email,
+                "fk": FK,
+                "base64": b64,
+            }
+            r = await self._post(SAVE_URL, payload, {
+                "Accept": "*/*",
+                "Accept-Encoding": "gzip",
+                "Content-Type": "application/json",
+                "User-Agent": "UnityPlayer/2022.3.62f2 (UnityWebRequest/1.0, libcurl/8.10.1-DEV)",
+                "X-Unity-Version": "2022.3.62f2",
+            })
+            # Some versions of this endpoint return HTTP/JSON success without
+            # a boolean result. Treat explicit result=0 as failure, otherwise
+            # verify by reloading the record before reporting success.
+            if isinstance(r, dict) and "result" in r and r.get("result") in (0, False, "0"):
+                return {"ok": False, "message": f"FULL_SAVE_FAILED: {str(r)[:160]}"}
+            if isinstance(r, dict) and isinstance(r.get("error"), dict):
+                return {"ok": False, "message": f"FULL_SAVE_FAILED: {str(r)[:160]}"}
+            return {"ok": True, "response": r}
+        except Exception as e:
+            log.exception("Full save error")
+            return {"ok": False, "message": f"FULL_SAVE_ERROR: {e}"}
+
+    async def _reload_and_verify(self, uid, checker, label):
+        """Force a fresh server load and verify the requested change."""
+        if not await self.load(uid, force=True):
+            return {"ok": False, "message": f"{label}_VERIFY_LOAD_FAILED"}
+        td = self.get_token_data(uid) or {}
+        fresh = self.get_record(uid, td.get("email")) or {}
+        try:
+            if checker(fresh):
+                return {"ok": True}
+            return {"ok": False, "message": f"{label}_VERIFY_FAILED"}
+        except Exception as e:
+            return {"ok": False, "message": f"{label}_VERIFY_ERROR: {e}"}
+
     async def _save(self, uid, data):
         ok,msg,auth = await self.get_auth(uid)
         if not ok: return {"ok":False,"message":msg}
@@ -1000,36 +1084,105 @@ class CPMNuker:
         return await self._save(uid,d)
 
     async def unlock_headlights(self, uid):
-        """Unlock headlights through the existing feature-flag save path."""
-        return await self._set_floats(uid, [(35, 1.0)])
-
-    async def unlock_all_clothes(self, uid):
-        """Unlock all clothes using the same equipment format as mainbotcpm.py."""
-        await self.load(uid)
+        """Enable headlights, then verify the flag survived a fresh server load."""
+        await self.load(uid, force=True)
         td = self.get_token_data(uid) or {}
         email = td.get("email")
         d = deepcopy(self.get_record(uid, email))
-
         if not d or not d.get("Name"):
-            return {
-                "ok": False,
-                "message": "Could not load account data. Try Refresh first."
-            }
+            return {"ok": False, "message": "Could not load account data. Try Refresh first."}
 
-        male = []
-        female = []
-        for i in range(1, 200):
-            male.append({"type": 0, "id": i, "color": 0})
-            female.append({"type": 0, "id": i, "color": 0})
+        floats = list(d.get("floats") or [])
+        while len(floats) <= 35:
+            floats.append(0.0)
+        floats[35] = 1.0
+        d["floats"] = floats
 
-        d["personEquipmentsMale"] = male
-        d["personEquipmentsFemale"] = female
+        # Try the normal partial-save route first.
+        saved = await self._save(uid, d)
+        if not saved.get("ok"):
+            # If the partial endpoint rejects the field packet, retry with the
+            # complete player record format.
+            saved = await self._full_save_record(uid, d)
+            if not saved.get("ok"):
+                return saved
 
-        return await self._save(uid, d)
+        verified = await self._reload_and_verify(
+            uid,
+            lambda fresh: len(fresh.get("floats") or []) > 35 and float((fresh.get("floats") or [])[35]) >= 1.0,
+            "HEADLIGHTS",
+        )
+        if not verified.get("ok"):
+            return verified
+        return {"ok": True, "message": "Headlights saved and verified."}
 
+    async def unlock_all_clothes(self, uid):
+        """Unlock the flat CPM clothing inventory and verify it after saving."""
+        await self.load(uid, force=True)
+        td = self.get_token_data(uid) or {}
+        email = td.get("email")
+        d = deepcopy(self.get_record(uid, email))
+        if not d or not d.get("Name"):
+            return {"ok": False, "message": "Could not load account data. Try Refresh first."}
+
+        # The equipment layout used by this record format is a flat list of
+        # typed items. Preserve existing items and add IDs 1..199 for both
+        # genders, matching the mechanism present in mainbotcpm.py.
+        def normalize(items):
+            out = []
+            seen = set()
+            for item in items or []:
+                if not isinstance(item, dict):
+                    continue
+                typ = int(item.get("type", 0))
+                iid = int(item.get("id", 0))
+                color = int(item.get("color", 0))
+                key = (typ, iid, color, float(item.get("float", 0.0))) if typ == 2 else (typ, iid, color)
+                if key in seen:
+                    continue
+                seen.add(key)
+                clean = {"type": typ, "id": iid}
+                if typ == 0:
+                    clean["color"] = color
+                elif typ == 2:
+                    clean["color"] = color
+                    clean["float"] = float(item.get("float", 0.0))
+                out.append(clean)
+            return out
+
+        for key in ("personEquipmentsMale", "personEquipmentsFemale"):
+            existing = normalize(d.get(key))
+            seen_ids = {int(x.get("id", 0)) for x in existing if int(x.get("type", 0)) == 0}
+            for iid in range(1, 200):
+                if iid not in seen_ids:
+                    existing.append({"type": 0, "id": iid, "color": 0})
+            d[key] = existing
+
+        # Use full-record save first for this feature. This avoids the
+        # SAVE_FAILED result=0 seen with the partial equipment packet.
+        saved = await self._full_save_record(uid, d)
+        if not saved.get("ok"):
+            # Fall back to partial save in case the deployment only accepts
+            # the authenticated field-packet form.
+            saved = await self._save(uid, d)
+            if not saved.get("ok"):
+                return saved
+
+        def clothes_verified(fresh):
+            for key in ("personEquipmentsMale", "personEquipmentsFemale"):
+                items = fresh.get(key) or []
+                ids = {int(x.get("id", 0)) for x in items if isinstance(x, dict) and int(x.get("type", 0)) == 0}
+                # Require the complete requested range, not merely one item.
+                if not set(range(1, 200)).issubset(ids):
+                    return False
+            return True
+
+        verified = await self._reload_and_verify(uid, clothes_verified, "ALL_CLOTHES")
+        if not verified.get("ok"):
+            return verified
+        return {"ok": True, "message": "All Clothes saved and verified."}
 
     async def unlock_houses(self, uid):
-
         return await self._set_integers(uid, [(8,1),(110,1),(111,1),(112,1)])
 
     async def complete_all_levels(self, uid):
