@@ -43,8 +43,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "online",
-        "bot": "𝗠𝗮𝘀𝗞𝘆𝘆𝗢𝗙𝗙𝗖 || 𝗕𝗢𝗧
-        ",
+        "bot": "𝗠𝗮𝘀𝗞𝘆𝘆𝗢𝗙𝗙𝗖 || 𝗕𝗢𝗧",
         "version": "1.0.0",
         "uptime": "running"
     })
