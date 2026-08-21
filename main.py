@@ -57,8 +57,8 @@ except ImportError:
 
 # ================= BOT TOKEN / OWNER =================
 # Isi langsung di file ini sebelum menjalankan bot.
-BOT_TOKEN = "ISI_TOKEN_BOT_ANDA_DI_SINI"
-OWNER_ID = 0  # isi dengan Telegram numeric user ID owner
+BOT_TOKEN = "8965382935:AAG7mpjOgtziaGlvgJI9SEc2Co1_4y5lVNE"
+OWNER_ID = 8700382637  # isi dengan Telegram numeric user ID owner
 
 # ================= FIREBASE SERVICE ACCOUNT =================
 # Firebase credentials are loaded from environment variables or a config file.
