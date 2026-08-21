@@ -18,9 +18,9 @@ OWNER_ID = int(os.getenv("OWNER_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "giveaway.db")
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN belum diisi.")
+    raise RuntimeError("8965382935:AAG7mpjOgtziaGlvgJI9SEc2Co1_4y5lVNE")
 if not OWNER_ID:
-    raise RuntimeError("OWNER_ID belum diisi.")
+    raise RuntimeError("8700382637")
 
 db_lock = asyncio.Lock()
 
