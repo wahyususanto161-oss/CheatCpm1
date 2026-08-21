@@ -117,7 +117,6 @@ HAS_BROTLI = True
 KEY_USAGE = {}  # {key: [list of user_ids]}
 KEY_USAGE_COUNT = {}  # {key: count}
 KEY_USERS_DETAILS = {}  # {key: {user_id: {"username": "...", "first_name": "...", "used_at": "..."}}}
-TIME_KEYS = {}  # {key: {"expires": datetime, "duration": hours, "used": False, "user_id": None, "created_by": None, "key_type": "time"}}
 TRIAL_KEYS = {}  # legacy trial keys
 FREE_TRIAL_USERS = {}  # track free trial usage
 
@@ -1596,7 +1595,53 @@ def init_stars_db():
         conn.commit()
         conn.execute("CREATE INDEX IF NOT EXISTS idx_star_payments_paid_at ON star_payments(paid_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_star_payments_plan ON star_payments(plan_code)")
+        conn.execute("""CREATE TABLE IF NOT EXISTS vip_plan_prices (
+            plan_code TEXT PRIMARY KEY,
+            stars INTEGER NOT NULL,
+            updated_by INTEGER,
+            updated_at REAL NOT NULL
+        )""")
         conn.commit()
+
+
+def load_custom_vip_prices():
+    """Load owner-configured Telegram Stars prices into the active VIP plans."""
+    with sqlite3.connect(STARS_DB_PATH) as conn:
+        rows = conn.execute("SELECT plan_code, stars FROM vip_plan_prices").fetchall()
+    for plan_code, stars in rows:
+        if plan_code in VIP_PLANS and int(stars) > 0:
+            VIP_PLANS[plan_code]["stars"] = int(stars)
+
+
+def set_vip_plan_price(plan_code, stars, updated_by):
+    if plan_code not in VIP_PLANS:
+        raise ValueError("Invalid VIP plan")
+    stars = int(stars)
+    if stars < 1:
+        raise ValueError("Price must be at least 1 Star")
+    VIP_PLANS[plan_code]["stars"] = stars
+    with sqlite3.connect(STARS_DB_PATH) as conn:
+        conn.execute("""INSERT INTO vip_plan_prices (plan_code, stars, updated_by, updated_at)
+                        VALUES (?, ?, ?, ?)
+                        ON CONFLICT(plan_code) DO UPDATE SET
+                        stars=excluded.stars,
+                        updated_by=excluded.updated_by,
+                        updated_at=excluded.updated_at""",
+                     (plan_code, stars, updated_by, time.time()))
+        conn.commit()
+
+
+def get_vip_prices_text():
+    return (
+        "⭐ **CURRENT VIP PRICES**\n━━━━━━━━━━━━━━━━━━━━━\n"
+        f"1️⃣ VIP 1 Day  : **{VIP_PLANS['1d']['stars']} Stars**\n"
+        f"7️⃣ VIP 7 Days : **{VIP_PLANS['7d']['stars']} Stars**\n"
+        f"1️⃣4️⃣ VIP 14 Days: **{VIP_PLANS['14d']['stars']} Stars**\n"
+        f"3️⃣0️⃣ VIP 30 Days: **{VIP_PLANS['30d']['stars']} Stars**\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n"
+        "📌 Only the Stars price can be changed here. The change is saved permanently."
+    )
+
 
 def get_vip_expiry(user_id):
     with sqlite3.connect(STARS_DB_PATH) as conn:
@@ -1657,12 +1702,12 @@ def save_star_payment(charge_id, user_id, plan_code, stars, currency):
 def create_vip_keyboard():
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(
-        types.InlineKeyboardButton("⭐ 1 DAY • 5 Stars", callback_data="vip_buy_1d"),
-        types.InlineKeyboardButton("⭐ 7 DAYS • 25 Stars", callback_data="vip_buy_7d")
+        types.InlineKeyboardButton(f"⭐ 1 DAY • {VIP_PLANS['1d']['stars']} Stars", callback_data="vip_buy_1d"),
+        types.InlineKeyboardButton(f"⭐ 7 DAYS • {VIP_PLANS['7d']['stars']} Stars", callback_data="vip_buy_7d")
     )
     markup.row(
-        types.InlineKeyboardButton("⭐ 14 DAYS • 45 Stars", callback_data="vip_buy_14d"),
-        types.InlineKeyboardButton("⭐ 30 DAYS • 80 Stars", callback_data="vip_buy_30d")
+        types.InlineKeyboardButton(f"⭐ 14 DAYS • {VIP_PLANS['14d']['stars']} Stars", callback_data="vip_buy_14d"),
+        types.InlineKeyboardButton(f"⭐ 30 DAYS • {VIP_PLANS['30d']['stars']} Stars", callback_data="vip_buy_30d")
     )
     return markup
 
@@ -1738,6 +1783,7 @@ def show_stars_revenue_dashboard(chat_id):
     bot.send_message(chat_id, text[:3900], parse_mode='Markdown')
 
 init_stars_db()
+load_custom_vip_prices()
 
 # ═══════════════════════════════════════════════════════════
 # 📢 ADMIN NOTIFICATION FUNCTION
@@ -1772,62 +1818,13 @@ def notify_admins(message_text, parse_mode='Markdown'):
             print(f"Failed to notify admin {admin_id}: {e}")
 
 # ═══════════════════════════════════════════════════════════
-# 🔑 TIME KEY FUNCTIONS
-# ═══════════════════════════════════════════════════════════
-
-def generate_time_key():
-    chars = string.ascii_uppercase + string.digits
-    return ''.join(random.choices(chars, k=16))
-
-def create_time_key(duration_hours: int, created_by: int) -> str:
-    key = generate_time_key()
-    TIME_KEYS[key] = {
-        "expires": datetime.now() + timedelta(hours=duration_hours),
-        "duration": duration_hours,
-        "used": False,
-        "user_id": None,
-        "created_by": created_by,
-        "created_at": datetime.now(),
-        "key_type": "time"
-    }
-    return key
-
-def use_time_key(key: str, user_id: int) -> Tuple[bool, str]:
-    if key not in TIME_KEYS:
-        return False, "Key not found"
-    
-    key_data = TIME_KEYS[key]
-    
-    # Check if expired
-    if datetime.now() > key_data["expires"]:
-        return False, "Key has expired"
-    
-    # If key was used before
-    if key_data["used"]:
-        # Check: same user who used it before
-        if key_data["user_id"] == user_id:
-            return True, "Key is still valid for you"
-        else:
-            return False, "Key already used by another user"
-    
-    # First time using this key
-    key_data["used"] = True
-    key_data["user_id"] = user_id
-    return True, "Key activated successfully"
-
-def get_time_key_info(key: str) -> Dict[str, Any]:
-    if key not in TIME_KEYS:
-        return None
-    return TIME_KEYS[key]
-
-# ═══════════════════════════════════════════════════════════
 # 💎 VIP KEY FUNCTIONS
 # ═══════════════════════════════════════════════════════════
 
 def generate_vip_key():
     """Generate a branded, unique VIP key for automatic and manual VIP sales."""
     prefix = "MasKyyOFFC"
-    existing_keys = set(TRIAL_KEYS) | set(TIME_KEYS) | set(ALLOWED_KEYS)
+    existing_keys = set(TRIAL_KEYS) | set(ALLOWED_KEYS)
     while True:
         # 3 unique random digits, e.g. MasKyyOFFC-482
         unique_digits = ''.join(random.choices(string.digits, k=3))
@@ -1987,10 +1984,9 @@ def get_text(chat_id, key, **kwargs):
         "unlock_cars_fail": "🔴 **GARAGE UNLOCK FAILED**",
         "unlock_cars_auto_done": "🟢 **AUTO INJECTION COMPLETE** // `{success}/270`",
         "logout": "🟣 **SESSION TERMINATED**",
-        "free_trial_first": "💎 **VIP KEY MODE ACTIVE** // 10 MINUTES",
+        "free_trial_first": "💎 **VIP KEY MODE ACTIVE** // 2 MINUTES",
         "trial_activating": "⚡ **INITIALIZING VIP KEY MODE...**",
         "start_normal_key": "🔑 KEY ACCESS",
-        "start_time_key": "⏱️ TIME ACCESS",
         "start_free_trial": "💎 VIP KEY",
         "main_cpm1": "⚡ CPM1 ARENA",
         "main_cpm2": "🎮 CPM2 ARENA",
@@ -2025,7 +2021,6 @@ def get_text(chat_id, key, **kwargs):
         "unlock_cars_auto_cancel": "✖️ CANCEL",
         "unlock_cars_manual_prompt": "🖐️ **MANUAL INJECTION**\n🆔 Enter Car ID:",
         "unlock_cars_prompt": "╔══════════════════════════════╗\n║ 🚗 **GARAGE UNLOCK TERMINAL** 🚗 ║\n╠══════════════════════════════╣\n║ 📧 Account: `{email}`\n╚══════════════════════════════╝\n\n⚡ Choose injection mode.",
-        "time_key_title": "╔══ ⏱️ **TIME ACCESS** ══╗\nEnter your temporary access key."
     }
     text = texts.get(key, f"Missing text: {key}")
     if kwargs:
@@ -2124,10 +2119,7 @@ def refresh_account_data(chat_id):
 
 def create_start_keyboard(chat_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton("🟣 KEY ACCESS", callback_data="normal_key"),
-        types.InlineKeyboardButton("🔵 TIME KEY", callback_data="time_key")
-    )
+    markup.row(types.InlineKeyboardButton("🟣 KEY ACCESS", callback_data="normal_key"))
     markup.row(types.InlineKeyboardButton("⭐ BUY VIP WITH STARS", callback_data="buy_vip"))
     markup.row(types.InlineKeyboardButton("💎 FREE VIP KEY", callback_data="free_trial"))
     markup.row(types.InlineKeyboardButton("💎 CONTACT OWNER", url=OWNER_CONTACT))
@@ -2219,7 +2211,6 @@ def create_admin_keyboard(chat_id):
         ("📊  STATS", "admin_stats"),
         ("📢  BROADCAST", "admin_broadcast"),
         ("🔑  KEYS", "admin_keys"),
-        ("⏱️  TIME KEYS", "admin_time_keys"),
         ("📈  ANALYTICS", "admin_key_stats"),
         ("👥  USERS", "admin_key_users"),
         ("🔄  REFRESH ALL", "admin_refresh_all"),
@@ -2248,6 +2239,7 @@ def create_vip_admin_keyboard(chat_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     buttons = [
         ("💎  VIP KEYS", "admin_vip_keys"),
+        ("⭐  CUSTOM STARS PRICE", "admin_vip_prices"),
         ("➕  CREATE VIP KEY", "admin_create_vip_key"),
         ("🗑  DELETE VIP KEY", "admin_delete_vip_key"),
         ("➕  EXTEND VIP KEY", "admin_extend_vip_key"),
@@ -2507,7 +2499,6 @@ def show_active_vip_users(chat_id):
         for i, (user_id, expires_at, plan_code) in enumerate(rows, 1):
             text += f"{i}. 👤 `{user_id}`\n   ⏱️ Until: `{format_vip_expiry(expires_at)}`\n   💎 Source: `{plan_code}`\n"
     bot.send_message(chat_id, text[:3900], parse_mode='Markdown')
-
 
 
 def search_vip(query):
@@ -2834,6 +2825,43 @@ def handle_callback(call):
         bot.answer_callback_query(call.id)
         return
 
+    # ====== Owner: Custom Telegram Stars Prices ======
+    if data == "admin_vip_prices":
+        if not is_admin(chat_id):
+            bot.answer_callback_query(call.id, "Owner only", show_alert=True)
+            return
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(
+            types.InlineKeyboardButton(f"1 DAY • {VIP_PLANS['1d']['stars']} ⭐", callback_data="vip_price_1d"),
+            types.InlineKeyboardButton(f"7 DAYS • {VIP_PLANS['7d']['stars']} ⭐", callback_data="vip_price_7d")
+        )
+        markup.row(
+            types.InlineKeyboardButton(f"14 DAYS • {VIP_PLANS['14d']['stars']} ⭐", callback_data="vip_price_14d"),
+            types.InlineKeyboardButton(f"30 DAYS • {VIP_PLANS['30d']['stars']} ⭐", callback_data="vip_price_30d")
+        )
+        markup.row(types.InlineKeyboardButton("◀️ BACK", callback_data="admin_vip_menu"))
+        bot.send_message(chat_id, get_vip_prices_text() + "\n\nChoose the VIP package whose Stars price you want to change.", reply_markup=markup, parse_mode='Markdown')
+        bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("vip_price_") and data in ("vip_price_1d", "vip_price_7d", "vip_price_14d", "vip_price_30d"):
+        if not is_admin(chat_id):
+            bot.answer_callback_query(call.id, "Owner only", show_alert=True)
+            return
+        plan_code = data.replace("vip_price_", "", 1)
+        user_states[chat_id] = {"awaiting_vip_price": True, "vip_price_plan": plan_code}
+        plan = VIP_PLANS[plan_code]
+        bot.send_message(
+            chat_id,
+            f"⭐ **CUSTOM STARS PRICE**\n━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Package: **{plan['title']}**\n"
+            f"Current Price: **{plan['stars']} Stars**\n\n"
+            "Send the new price in Telegram Stars.\nExample: `15` means the package costs 15 Stars.",
+            parse_mode='Markdown'
+        )
+        bot.answer_callback_query(call.id)
+        return
+
     # ====== Admin: Advanced VIP Tools ======
     if data == "admin_vip_dashboard":
         if not is_admin(chat_id):
@@ -2982,7 +3010,7 @@ def handle_callback(call):
         bot.answer_callback_query(call.id, "🚫 Banned!", show_alert=True)
         return
 
-    if data not in ["check_sub", "normal_key", "time_key", "free_trial"]:
+    if data not in ["check_sub", "normal_key", "free_trial"]:
         if not check_subscription(chat_id):
             subscription_required(call.message)
             return
@@ -3008,11 +3036,6 @@ def handle_callback(call):
         bot.register_next_step_handler(call.message, check_key)
         return
 
-    if data == "time_key":
-        bot.answer_callback_query(call.id, "⏰ Enter time key...")
-        bot.send_message(chat_id, "⏰ **Enter your Time Key:**\n━━━━━━━━━━━━━━━━━━━━━\n📌 This key will give you access for a specific duration.", parse_mode='Markdown')
-        bot.register_next_step_handler(call.message, check_time_key)
-        return
 
     # ====== Free VIP Key ======
     if data == "free_trial":
@@ -3028,7 +3051,7 @@ def handle_callback(call):
             return
         
         # Create trial key
-        trial_key = create_vip_key(chat_id, 10, "minutes")
+        trial_key = create_vip_key(chat_id, 2, "minutes")
         # Mark as used immediately
         if trial_key in TRIAL_KEYS:
             TRIAL_KEYS[trial_key]["used"] = True
@@ -3068,7 +3091,7 @@ def handle_callback(call):
         user_sessions[chat_id]['logged_in'] = True
         user_sessions[chat_id]['is_vip'] = True
         user_sessions[chat_id]['vip_key'] = trial_key
-        vip_expires_at = activate_vip_for_seconds(chat_id, 10 * 60, 'vip_key')
+        vip_expires_at = activate_vip_for_seconds(chat_id, 2 * 60, 'vip_key')
         user_sessions[chat_id]['vip_expires_at'] = vip_expires_at
         
         # Notify admins
@@ -3079,7 +3102,7 @@ def handle_callback(call):
             f"🆔 Username: @{username}\n"
             f"🆔 ID: `{chat_id}`\n"
             f"🔑 Key: `{trial_key}`\n"
-            f"⏱️ VIP Duration: 10 minutes\n"
+            f"⏱️ VIP Duration: 2 minutes\n"
             f"📅 Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         )
         
@@ -3354,64 +3377,6 @@ def handle_callback(call):
         admin_panel(call.message)
         return
 
-    # ====== Admin: Time Keys ======
-    if data == "admin_time_keys":
-        if not is_admin(chat_id):
-            return
-        
-        markup = types.InlineKeyboardMarkup(row_width=2)
-        btn1 = types.InlineKeyboardButton("➕ Create Time Key", callback_data="time_key_create")
-        btn2 = types.InlineKeyboardButton("📊 List Keys", callback_data="time_key_list")
-        btn3 = types.InlineKeyboardButton("🗑️ Delete Key", callback_data="time_key_delete")
-        btn4 = types.InlineKeyboardButton("🔙 Back", callback_data="admin_panel")
-        markup.row(btn1, btn2)
-        markup.row(btn3)
-        markup.row(btn4)
-        
-        bot.send_message(chat_id, "⏰ **Manage Time Keys**\n━━━━━━━━━━━━━━━━━━━━━\n📌 Choose an action:", reply_markup=markup, parse_mode='Markdown')
-        return
-
-    if data == "time_key_create":
-        if not is_admin(chat_id):
-            return
-        bot.send_message(chat_id, "⏰ **Create Time Key**\n━━━━━━━━━━━━━━━━━━━━━\n📌 Enter duration in hours (e.g., 1, 12, 24, 48):", parse_mode='Markdown')
-        user_states[chat_id] = {'awaiting_time_key_hours': True}
-        return
-
-    if data == "time_key_list":
-        if not is_admin(chat_id):
-            return
-        
-        if not TIME_KEYS:
-            bot.send_message(chat_id, "📭 **No time keys**", parse_mode='Markdown')
-            admin_panel(call.message)
-            return
-        
-        text = "⏰ **Time Keys List**\n━━━━━━━━━━━━━━━━━━━━━\n\n"
-        for key, data in TIME_KEYS.items():
-            status = "❌ Expired" if datetime.now() > data["expires"] else "⏳ Valid"
-            if data["used"]:
-                status = "✅ Used"
-            remaining = (data["expires"] - datetime.now()).total_seconds() / 3600
-            text += f"🔑 `{key}`\n"
-            text += f"   ⏱️ {data['duration']} hours\n"
-            text += f"   📊 {status}\n"
-            if data["user_id"]:
-                text += f"   👤 User: `{data['user_id']}`\n"
-                if datetime.now() <= data["expires"] and data["user_id"]:
-                    text += f"   ✅ Still valid for this user\n"
-            text += f"   ─────────────────────\n"
-        
-        bot.send_message(chat_id, text, parse_mode='Markdown')
-        admin_panel(call.message)
-        return
-
-    if data == "time_key_delete":
-        if not is_admin(chat_id):
-            return
-        bot.send_message(chat_id, "🗑️ **Delete Time Key**\n━━━━━━━━━━━━━━━━━━━━━\n📌 Send the key to delete:", parse_mode='Markdown')
-        user_states[chat_id] = {'awaiting_time_key_delete': True}
-        return
 
     # ====== Admin: Key Stats ======
     if data == "admin_key_stats":
@@ -3428,16 +3393,7 @@ def handle_callback(call):
         else:
             stats_text += "  📭 No keys\n"
         
-        stats_text += "\n⏰ **Time Keys:**\n"
-        if TIME_KEYS:
-            for key, data in TIME_KEYS.items():
-                status = "🔒 Linked" if data.get("used") else "🟢 Ready"
-                count = KEY_USAGE_COUNT.get(key, 0)
-                duration_label = data.get("duration_label", f"{data.get('duration', 10)} minutes")
-                stats_text += f"  • `{key}` → {duration_label} • {status} ({count} users)\n"
-        else:
-            stats_text += "  📭 No time keys\n"
-        
+
         stats_text += "\n💎 **VIP Keys:**\n"
         if TRIAL_KEYS:
             for key, data in TRIAL_KEYS.items():
@@ -3466,9 +3422,6 @@ def handle_callback(call):
             count = KEY_USAGE_COUNT.get(key, 0)
             markup.add(types.InlineKeyboardButton(f"🔑 {key} ({count} users)", callback_data=f"show_key_users_{key}"))
         
-        for key in TIME_KEYS.keys():
-            count = KEY_USAGE_COUNT.get(key, 0)
-            markup.add(types.InlineKeyboardButton(f"⏰ {key} ({count} users)", callback_data=f"show_key_users_{key}"))
         
         for key in TRIAL_KEYS.keys():
             count = KEY_USAGE_COUNT.get(key, 0)
@@ -3512,7 +3465,7 @@ def handle_callback(call):
     if data == "admin_stats":
         if not is_admin(chat_id):
             return
-        stats_text = f"📊 **General Statistics**\n━━━━━━━━━━━━━━━━━━━━━\n👥 Users: {len(total_users)}\n🟢 Sessions: {len([u for u in user_sessions if user_sessions[u].get('logged_in')])}\n🔑 Normal Keys: {len(ALLOWED_KEYS)}\n⏰ Time Keys: {len(TIME_KEYS)}\n💎 VIP Keys: {len(TRIAL_KEYS)}\n🚫 Banned: {len(banned_users)}\n💾 Saved Accounts: {sum(len(accs) for accs in saved_accounts.values())}"
+        stats_text = f"📊 **General Statistics**\n━━━━━━━━━━━━━━━━━━━━━\n👥 Users: {len(total_users)}\n🟢 Sessions: {len([u for u in user_sessions if user_sessions[u].get('logged_in')])}\n🔑 Normal Keys: {len(ALLOWED_KEYS)}\n💎 VIP Keys: {len(TRIAL_KEYS)}\n🚫 Banned: {len(banned_users)}\n💾 Saved Accounts: {sum(len(accs) for accs in saved_accounts.values())}"
         bot.send_message(chat_id, stats_text, parse_mode='Markdown')
         admin_panel(call.message)
         return
@@ -3609,100 +3562,6 @@ def handle_callback(call):
 # 📝 KEY HANDLERS
 # ═══════════════════════════════════════════════════════════
 
-def check_time_key(message):
-    """Handle time key entry"""
-    chat_id = message.chat.id
-    key = message.text.strip()
-    
-    try:
-        user = bot.get_chat(chat_id)
-        username = user.username or "No username"
-        first_name = user.first_name or "Unknown"
-    except:
-        username = "Unknown"
-        first_name = "Unknown"
-
-    if chat_id not in user_sessions:
-        user_sessions[chat_id] = {}
-
-    # Check time key
-    if key in TIME_KEYS:
-        success, msg = use_time_key(key, chat_id)
-        if success:
-            user_sessions[chat_id]['logged_in'] = True
-            user_sessions[chat_id]['is_time_key'] = True
-            
-            # Track usage (no duplicates)
-            if key not in KEY_USAGE:
-                KEY_USAGE[key] = []
-                KEY_USERS_DETAILS[key] = {}
-            if chat_id not in KEY_USAGE[key]:
-                KEY_USAGE[key].append(chat_id)
-                KEY_USAGE_COUNT[key] = len(KEY_USAGE[key])
-            
-            KEY_USERS_DETAILS[key][chat_id] = {
-                "username": username,
-                "first_name": first_name,
-                "used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "type": "time_key"
-            }
-            
-            key_data = TIME_KEYS[key]
-            notify_admins(
-                f"⏰ **Time Key Used**\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 Name: `{first_name}`\n"
-                f"🆔 Username: @{username}\n"
-                f"🆔 ID: `{chat_id}`\n"
-                f"🔑 Key: `{key}`\n"
-                f"⏱️ Duration: {key_data['duration']} hours\n"
-                f"📅 Expires: {key_data['expires'].strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"📊 Users: {KEY_USAGE_COUNT[key]}"
-            )
-            
-            bot.send_message(chat_id, f"✅ **Key activated successfully!**\n⏱️ Valid for {key_data['duration']} hours\n📅 Expires: {key_data['expires'].strftime('%Y-%m-%d %H:%M:%S')}", parse_mode='Markdown')
-            menu_command(message)
-            return
-        else:
-            bot.send_message(chat_id, f"❌ **{msg}**", parse_mode='Markdown')
-            start(message)
-            return
-    
-    # Check normal keys
-    if key in ALLOWED_KEYS:
-        user_sessions[chat_id]['logged_in'] = True
-        
-        if key not in KEY_USAGE:
-            KEY_USAGE[key] = []
-            KEY_USERS_DETAILS[key] = {}
-        if chat_id not in KEY_USAGE[key]:
-            KEY_USAGE[key].append(chat_id)
-            KEY_USAGE_COUNT[key] = len(KEY_USAGE[key])
-        
-        KEY_USERS_DETAILS[key][chat_id] = {
-            "username": username,
-            "first_name": first_name,
-            "used_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "type": "normal"
-        }
-        
-        notify_admins(
-            f"🔑 **Normal Key Used**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 Name: `{first_name}`\n"
-            f"🆔 Username: @{username}\n"
-            f"🆔 ID: `{chat_id}`\n"
-            f"🔑 Key: `{key}`\n"
-            f"⏱️ Duration: {trial_data.get('duration_label', str(trial_data.get('duration', 10)) + ' minutes')}\n"
-            f"📊 Users: {KEY_USAGE_COUNT[key]}"
-        )
-        
-        add_log(chat_id, f"Key activated: {key}")
-        bot.send_message(chat_id, get_text(chat_id, "key_success"), parse_mode='Markdown')
-        menu_command(message)
-    else:
-        bot.send_message(chat_id, get_text(chat_id, "wrong_key"), parse_mode='Markdown')
-        start(message)
 
 def check_key(message):
     """Handle normal key entry"""
@@ -4364,6 +4223,36 @@ def handle_all_messages(message):
             admin_panel(message)
             return
 
+        # ====== Owner: Custom Telegram Stars Price ======
+        if state.get('awaiting_vip_price'):
+            if not is_admin(chat_id):
+                del user_states[chat_id]
+                return
+            plan_code = state.get('vip_price_plan')
+            try:
+                new_price = int(text.strip())
+                if new_price < 1 or new_price > 250000:
+                    raise ValueError
+                old_price = VIP_PLANS[plan_code]['stars']
+                set_vip_plan_price(plan_code, new_price, chat_id)
+                plan = VIP_PLANS[plan_code]
+                bot.send_message(
+                    chat_id,
+                    f"✅ **VIP PRICE UPDATED!**\n━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"Package: **{plan['title']}**\n"
+                    f"Old Price: **{old_price} Stars**\n"
+                    f"New Price: **{new_price} Stars**\n"
+                    "💾 The price is saved permanently.",
+                    parse_mode='Markdown'
+                )
+                add_log(chat_id, f"VIP price changed: {plan_code} {old_price} -> {new_price} Stars")
+            except (ValueError, TypeError, KeyError):
+                bot.send_message(chat_id, "❌ **Invalid price.** Send a whole number between `1` and `250000` Stars.", parse_mode='Markdown')
+                return
+            del user_states[chat_id]
+            show_vip_admin_menu(chat_id)
+            return
+
         # ====== Admin: Custom VIP Key - Create ======
         if state.get('awaiting_vip_key_duration'):
             if not is_admin(chat_id):
@@ -4407,53 +4296,6 @@ def handle_all_messages(message):
             admin_panel(message)
             return
 
-        # ====== Admin: Time Key - Create ======
-        if state.get('awaiting_time_key_hours'):
-            if not is_admin(chat_id):
-                del user_states[chat_id]
-                return
-            try:
-                hours = int(text.strip())
-                if hours <= 0:
-                    bot.send_message(chat_id, "❌ **Must be greater than 0!**", parse_mode='Markdown')
-                    return
-                if hours > 720:
-                    bot.send_message(chat_id, "⚠️ **Maximum 720 hours (30 days)**", parse_mode='Markdown')
-                    return
-                
-                new_key = create_time_key(hours, chat_id)
-                bot.send_message(chat_id, f"✅ **Key created!**\n━━━━━━━━━━━━━━━━━━━━━\n🔑 `{new_key}`\n⏱️ Duration: {hours} hours\n📅 Expires: {(datetime.now() + timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')}\n━━━━━━━━━━━━━━━━━━━━━\n📌 Send this key to the user", parse_mode='Markdown')
-                
-                notify_admins(
-                    f"⏰ **Time Key Created**\n"
-                    f"━━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🔑 Key: `{new_key}`\n"
-                    f"⏱️ Duration: {hours} hours\n"
-                    f"👤 By: `{chat_id}`\n"
-                    f"📅 Expires: {(datetime.now() + timedelta(hours=hours)).strftime('%Y-%m-%d %H:%M:%S')}"
-                )
-                
-            except ValueError:
-                bot.send_message(chat_id, "❌ **Enter a valid number!**", parse_mode='Markdown')
-            
-            del user_states[chat_id]
-            admin_panel(message)
-            return
-
-        # ====== Admin: Time Key - Delete ======
-        if state.get('awaiting_time_key_delete'):
-            if not is_admin(chat_id):
-                del user_states[chat_id]
-                return
-            key = text.strip()
-            if key in TIME_KEYS:
-                del TIME_KEYS[key]
-                bot.send_message(chat_id, f"✅ **Deleted key `{key}`**", parse_mode='Markdown')
-            else:
-                bot.send_message(chat_id, "❌ **Key not found!**", parse_mode='Markdown')
-            del user_states[chat_id]
-            admin_panel(message)
-            return
 
         # ====== Admin: Broadcast ======
         if state.get('awaiting_broadcast'):
@@ -4548,8 +4390,7 @@ if __name__ == "__main__":
     print("✅ Bot is running!")
     print("👑 Admins:", ", ".join(map(str, ADMIN_IDS)))
     print("🔑 VIP Keys: MasKyyOFFC-XXX (unique per purchase)")
-    print("⏰ Time Keys: Supported (Admin can create keys with custom hours)")
-    print("🎁 Free Trial: Supported (10 minutes)")
+    print("🎁 Free Trial: Supported (2 minutes)")
     print("⭐ Telegram Stars: VIP payments enabled")
     print("💎 VIP Auto Activation: 1 / 7 / 14 / 30 days")
     print("📊 Stars Dashboard: /stars (admin only)")
